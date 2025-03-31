@@ -232,9 +232,11 @@ def overlayWaypoint3DCylinder(img, target_pos, drone_pos, attitude, fov_diag_deg
     line = lines_from_points(traj)
 
     # Convert the polyline to a tube to give it a visible width.
+    line['distance'] = range(traj.shape[0])
     road_tube = line.ribbon(width=0.02, normal=[0, 0, 1])
-    road_actor = plotter.add_mesh(road_tube, color="blue")
+   
 
+    road_actor = plotter.add_mesh(road_tube, cmap="Blues", show_scalar_bar=False)
     # Compute camera pose from attitude.
     roll, pitch, yaw = attitude
     forward_vec = np.array([1, 0, 0])
@@ -337,87 +339,132 @@ def run(
         ):
     #### Initialize the simulation #############################
    
-
-    #### Initialize a circular trajectory ######################
-    INIT_XYZS,INIT_RPYS,TARGET_POS,NUM_WP,wp_counters,cube_pos = initializeTrajectoryTowardsObject(num_drones,control_freq_hz)
+    # Get initial trajectory and cube position.
+    INIT_XYZS, INIT_RPYS, TARGET_POS, NUM_WP, wp_counters, cube_pos = initializeTrajectoryTowardsObject(num_drones, control_freq_hz)
 
     #### Create the environment ################################
     env = CtrlAviary(drone_model=drone,
-                        num_drones=num_drones,
-                        initial_xyzs=INIT_XYZS,
-                        initial_rpys=INIT_RPYS,
-                        physics=physics,
-                        neighbourhood_radius=10,
-                        pyb_freq=simulation_freq_hz,
-                        ctrl_freq=control_freq_hz,
-                        gui=False,
-                        record=record_video,
-                        obstacles=obstacles,
-                        user_debug_gui=False,
-                        vision_attributes=True
-                        )
+                     num_drones=num_drones,
+                     initial_xyzs=INIT_XYZS,
+                     initial_rpys=INIT_RPYS,
+                     physics=physics,
+                     neighbourhood_radius=10,
+                     pyb_freq=simulation_freq_hz,
+                     ctrl_freq=control_freq_hz,
+                     gui=False,
+                     record=record_video,
+                     obstacles=obstacles,
+                     user_debug_gui=False,
+                     vision_attributes=True
+                     )
     
-    ###init vizualiation
+    ### Init visualization
     initViz()
 
     #### Obtain the PyBullet Client ID from the environment ####
     PYB_CLIENT = env.getPyBulletClient()
 
-    # Load the cube at the randomized position.
-    p.loadURDF("cube_no_rotation.urdf",
-               cube_pos,
-               p.getQuaternionFromEuler([0, 0, 0]),
-               physicsClientId=PYB_CLIENT)
+    # Load the cube URDF once and store its unique ID.
+    cube_id = p.loadURDF("cube_no_rotation.urdf",
+                         cube_pos,
+                         p.getQuaternionFromEuler([0, 0, 0]),
+                         physicsClientId=PYB_CLIENT)
 
-    ##Initialize the optical flow tracker
+    ## Initialize the optical flow tracker
     dt = env.CTRL_TIMESTEP
     of_tracker = OpticalFlowTracker(dt)
 
     #### Initialize the controllers ############################
     if drone in [DroneModel.CF2X, DroneModel.CF2P]:
-        ctrl = [DSLPIDControl(drone_model=drone) for i in range(num_drones)]
+        ctrl = [DSLPIDControl(drone_model=drone) for _ in range(num_drones)]
 
     #### Run the simulation ####################################
-    action = np.zeros((num_drones,4))
-    START = time.time()
-    for i in range(0, int(duration_sec*env.CTRL_FREQ)):
+    action = np.zeros((num_drones, 4))
+    PERIOD = 10  # seconds for a full trajectory generation
+    NUM_WP = control_freq_hz * PERIOD  # number of waypoints in trajectory
 
+    START = time.time()
+    for i in range(0, int(duration_sec * env.CTRL_FREQ)):
+        #### Update the cube position: move left/right by ±1 meter.
+        # Randomly choose a shift in x-direction (±1 meter)
+        if i < 50:
+            delta_x = 0.0
+            cube_pos[1] += delta_x
+            # Reset the cube's position in the simulation.
+            p.resetBasePositionAndOrientation(cube_id,
+                                            cube_pos,
+                                            p.getQuaternionFromEuler([0, 0, 0]),
+                                            physicsClientId=PYB_CLIENT)
+
+        #### Regenerate the trajectory from the current drone position to the new cube position.
+        # First, get the current drone position.
+        current_drone = obs[0][0:3] if i > 0 else INIT_XYZS[0]
+        # Use current_drone[2] as the starting altitude and cube_pos[2] as the landing altitude.
+        start_z = current_drone[2]
+        target_z = cube_pos[2]
+        new_TARGET_POS = np.zeros((NUM_WP, 3))
+        for j in range(NUM_WP):
+            # Linear interpolation for xy components.
+            alpha = j / (NUM_WP - 1)
+            new_TARGET_POS[j, :2] = (1 - alpha) * np.array(current_drone[:2]) + alpha * np.array(cube_pos[:2])
+            # Compute 2D distance from this waypoint to the target.
+            d = np.linalg.norm(np.array(cube_pos[:2]) - new_TARGET_POS[j, :2])
+            if d > 10:
+                # Stay at the high (start) altitude.
+                new_TARGET_POS[j, 2] = start_z
+            else:
+                # When within 10 m, interpolate altitude with smoothstep function.
+                # t = 0 when d=10, and t = 1 when d=0.
+                t = (10 - d) / 10
+                # Smoothstep: f(t) = start_z + (target_z - start_z)*(3*t^2 - 2*t^3)
+                new_TARGET_POS[j, 2] = start_z + (target_z - start_z) * (3 * t**2 - 2 * t**3)
         #### Step the simulation ###################################
         obs, reward, terminated, truncated, info = env.step(action)
         altitude = obs[0][2]
         attitude = obs[0][7:10] 
         lin_accel = obs[0][20:23]
-        rgb,rgb_down, rgb_fixed = env._getDroneImages(0,False)
+        rgb, rgb_down, rgb_fixed = env._getDroneImages(0, False)
         rgb_disp = rgb[:, :, :3].astype(np.uint8)
         rgb_down_disp = rgb_down[:, :, :3].astype(np.uint8)
         rgb_fixed_disp = rgb_fixed[:, :, :3].astype(np.uint8)
         
         rgb_down_disp_copy = rgb_down_disp.copy()
         
-        est_vel= of_tracker.update(rgb_down_disp_copy, draw_on=rgb_down_disp,attitude=attitude,altitude=altitude,lin_accel=lin_accel)
+        est_vel = of_tracker.update(rgb_down_disp_copy, draw_on=rgb_down_disp,
+                                    attitude=attitude, altitude=altitude, lin_accel=lin_accel)
 
         actual_vel = obs[0][10:12]
-        #print difference between actual and predicted vel
         diff = (est_vel - actual_vel)**2
-        rgb_disp = overlayWaypoint3DCylinder(rgb_disp, target_pos=[0,0,0.5], fov_diag_deg=70,drone_pos=obs[0][0:3], attitude=attitude, traj=TARGET_POS)
-        # Combine the two images horizontally
-        combined_img = np.hstack((rgb_disp, rgb_down_disp))
         
+        # Use the regenerated trajectory for overlay drawing.
+        rgb_disp = overlayWaypoint3DCylinder(rgb_disp,
+                                             target_pos=cube_pos,
+                                             fov_diag_deg=70,
+                                             drone_pos=obs[0][0:3],
+                                             attitude=attitude,
+                                             traj=new_TARGET_POS)
+        # Combine the images horizontally.
+        combined_img = np.hstack((rgb_disp, rgb_down_disp))
         cv2.imshow("Combined Drone Views", combined_img)
         cv2.waitKey(1)
-    
 
-        #### Compute control for the current way point #############
+        #### Compute control for the current waypoint #############
+        # Update target orientation so that the drone points directly toward the cube.
+        # Calculate yaw = math.atan2(delta_y, delta_x) from current drone position to cube.
+        current_drone = obs[0][0:3]
+        target_yaw = math.atan2(cube_pos[1] - current_drone[1], cube_pos[0] - current_drone[0])
+        new_target_rpy = [0, 0, target_yaw]  # roll and pitch remain 0.
+    
+        #### Compute control for the current waypoint #############
         for j in range(num_drones):
             action[j, :], _, _ = ctrl[j].computeControlFromState(control_timestep=env.CTRL_TIMESTEP,
-                                                                    state=obs[j],
-                                                                    target_pos=TARGET_POS[wp_counters[j], :],  # use full 3D target position now
-                                                                    target_rpy=INIT_RPYS[j, :]
-                                                                    )
+                                                                  state=obs[j],
+                                                                  target_pos=new_TARGET_POS[wp_counters[j], :],
+                                                                  target_rpy=new_target_rpy)
 
-        #### Go to the next way point and loop #####################
+        #### Go to the next waypoint and loop #####################
         for j in range(num_drones):
-            wp_counters[j] = wp_counters[j] + 1 if wp_counters[j] < (NUM_WP-1) else 0
+            wp_counters[j] = wp_counters[j] + 1 if wp_counters[j] < (NUM_WP - 1) else 0
 
     #### Close the environment #################################
     env.close()
