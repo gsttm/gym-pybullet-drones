@@ -6,8 +6,6 @@ from datetime import datetime
 import xml.etree.ElementTree as etxml
 import pkg_resources
 from PIL import Image
-# import pkgutil
-# egl = pkgutil.get_loader('eglRenderer')
 import numpy as np
 import pybullet as p
 import pybullet_data
@@ -132,7 +130,7 @@ class BaseAviary(gym.Env):
             os.makedirs(os.path.dirname(self.ONBOARD_IMG_PATH), exist_ok=True)
         self.VISION_ATTR = vision_attributes
         if self.VISION_ATTR:
-            self.IMG_RES = np.array([64, 48])
+            self.IMG_RES = np.array([224,224])
             self.IMG_FRAME_PER_SEC = 24
             self.IMG_CAPTURE_FREQ = int(self.PYB_FREQ/self.IMG_FRAME_PER_SEC)
             self.rgb = np.zeros(((self.NUM_DRONES, self.IMG_RES[1], self.IMG_RES[0], 4)))
@@ -288,33 +286,7 @@ class BaseAviary(gym.Env):
             in each subclass for its format.
 
         """
-        #### Save PNG video frames if RECORD=True and GUI=False ####
-        if self.RECORD and not self.GUI and self.step_counter%self.CAPTURE_FREQ == 0:
-            [w, h, rgb, dep, seg] = p.getCameraImage(width=self.VID_WIDTH,
-                                                     height=self.VID_HEIGHT,
-                                                     shadow=1,
-                                                     viewMatrix=self.CAM_VIEW,
-                                                     projectionMatrix=self.CAM_PRO,
-                                                     renderer=p.ER_TINY_RENDERER,
-                                                     flags=p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX,
-                                                     physicsClientId=self.CLIENT
-                                                     )
-            (Image.fromarray(np.reshape(rgb, (h, w, 4)), 'RGBA')).save(os.path.join(self.IMG_PATH, "frame_"+str(self.FRAME_NUM)+".png"))
-            #### Save the depth or segmentation view instead #######
-            # dep = ((dep-np.min(dep)) * 255 / (np.max(dep)-np.min(dep))).astype('uint8')
-            # (Image.fromarray(np.reshape(dep, (h, w)))).save(self.IMG_PATH+"frame_"+str(self.FRAME_NUM)+".png")
-            # seg = ((seg-np.min(seg)) * 255 / (np.max(seg)-np.min(seg))).astype('uint8')
-            # (Image.fromarray(np.reshape(seg, (h, w)))).save(self.IMG_PATH+"frame_"+str(self.FRAME_NUM)+".png")
-            self.FRAME_NUM += 1
-            if self.VISION_ATTR:
-                for i in range(self.NUM_DRONES):
-                    self.rgb[i], self.dep[i], self.seg[i] = self._getDroneImages(i)
-                    #### Printing observation to PNG frames example ############
-                    self._exportImage(img_type=ImageType.RGB, # ImageType.BW, ImageType.DEP, ImageType.SEG
-                                    img_input=self.rgb[i],
-                                    path=self.ONBOARD_IMG_PATH+"/drone_"+str(i)+"/",
-                                    frame_num=int(self.step_counter/self.IMG_CAPTURE_FREQ)
-                                    )
+       
         #### Read the GUI's input parameters #######################
         if self.GUI and self.USER_DEBUG:
             current_input_switch = p.readUserDebugParameter(self.INPUT_SWITCH, physicsClientId=self.CLIENT)
@@ -473,6 +445,10 @@ class BaseAviary(gym.Env):
         self.rpy = np.zeros((self.NUM_DRONES, 3))
         self.vel = np.zeros((self.NUM_DRONES, 3))
         self.ang_v = np.zeros((self.NUM_DRONES, 3))
+        self.prev_vel = np.zeros((self.NUM_DRONES, 3))
+        self.prev_ang = np.zeros((self.NUM_DRONES, 3))
+        self.lin_acc = np.zeros((self.NUM_DRONES, 3))
+        self.ang_acc = np.zeros((self.NUM_DRONES, 3))
         if self.PHYSICS == Physics.DYN:
             self.rpy_rates = np.zeros((self.NUM_DRONES, 3))
         #### Set PyBullet's parameters #############################
@@ -507,16 +483,24 @@ class BaseAviary(gym.Env):
     ################################################################################
 
     def _updateAndStoreKinematicInformation(self):
-        """Updates and stores the drones kinemaatic information.
+        """Updates and stores the drones kinematic information including linear and angular accelerations."""
+        dt = self.PYB_TIMESTEP  # using PyBullet timestep as dt
+        for i in range(self.NUM_DRONES):
+            # Get previous velocities (if available)
+            old_vel = self.vel[i].copy()
+            old_ang = self.ang_v[i].copy()
 
-        This method is meant to limit the number of calls to PyBullet in each step
-        and improve performance (at the expense of memory).
-
-        """
-        for i in range (self.NUM_DRONES):
             self.pos[i], self.quat[i] = p.getBasePositionAndOrientation(self.DRONE_IDS[i], physicsClientId=self.CLIENT)
             self.rpy[i] = p.getEulerFromQuaternion(self.quat[i])
             self.vel[i], self.ang_v[i] = p.getBaseVelocity(self.DRONE_IDS[i], physicsClientId=self.CLIENT)
+
+            # Compute accelerations using finite differences
+            self.lin_acc[i] = (self.vel[i] - old_vel) / dt
+            self.ang_acc[i] = (self.ang_v[i] - old_ang) / dt
+
+            # Optionally update previous velocities (not strictly necessary if using the current ones in this step)
+            self.prev_vel[i] = self.vel[i].copy()
+            self.prev_ang[i] = self.ang_v[i].copy()
     
     ################################################################################
 
@@ -556,9 +540,17 @@ class BaseAviary(gym.Env):
             to understand its format.
 
         """
-        state = np.hstack([self.pos[nth_drone, :], self.quat[nth_drone, :], self.rpy[nth_drone, :],
-                           self.vel[nth_drone, :], self.ang_v[nth_drone, :], self.last_clipped_action[nth_drone, :]])
-        return state.reshape(20,)
+        state = np.hstack([
+            self.pos[nth_drone, :],
+            self.quat[nth_drone, :],
+            self.rpy[nth_drone, :],
+            self.vel[nth_drone, :],
+            self.ang_v[nth_drone, :],
+            self.last_clipped_action[nth_drone, :],
+            self.lin_acc[nth_drone, :],
+            self.ang_acc[nth_drone, :]
+        ])
+        return state.reshape(-1,)  # Now the state vector includes lin_acc and ang_acc
 
     ################################################################################
 
@@ -592,16 +584,39 @@ class BaseAviary(gym.Env):
         rot_mat = np.array(p.getMatrixFromQuaternion(self.quat[nth_drone, :])).reshape(3, 3)
         #### Set target point, camera view and projection matrices #
         target = np.dot(rot_mat,np.array([1000, 0, 0])) + np.array(self.pos[nth_drone, :])
-        DRONE_CAM_VIEW = p.computeViewMatrix(cameraEyePosition=self.pos[nth_drone, :]+np.array([0, 0, self.L]),
+        DRONE_CAM_VIEW = p.computeViewMatrix(cameraEyePosition=self.pos[nth_drone, :]+np.array([0, 0, self.L])+ np.array([-0.1, 0, 0]),
                                              cameraTargetPosition=target,
                                              cameraUpVector=[0, 0, 1],
                                              physicsClientId=self.CLIENT
                                              )
-        DRONE_CAM_PRO =  p.computeProjectionMatrixFOV(fov=60.0,
+        DRONE_DOWNWARD_VIEW = p.computeViewMatrix(
+            cameraEyePosition=self.pos[nth_drone, :] + np.array([0, 0, self.L]) + np.array([0, 0, -0.03]),
+            cameraTargetPosition=self.pos[nth_drone, :],
+            cameraUpVector=[0, 1, 0],  # set an appropriate up vector for a downward view
+            physicsClientId=self.CLIENT
+        )
+        DRONE_CAM_PRO =  p.computeProjectionMatrixFOV(fov=70.0,
                                                       aspect=1.0,
                                                       nearVal=self.L,
                                                       farVal=1000.0
                                                       )
+        
+        DRONE_CAM_PRO_FIXED =  p.computeProjectionMatrixFOV(fov=30.0,
+                                                      aspect=1.0,
+                                                      nearVal=self.L,
+                                                      farVal=1000.0
+                                                      )
+        
+        fixed_angle_position = np.array([1, 1, 2])   # Adjust this position as needed.
+        DRONE_ANGLE_VIEW = p.computeViewMatrix(
+            cameraEyePosition=fixed_angle_position,
+            cameraTargetPosition=self.pos[nth_drone, :],
+            cameraUpVector=[0, 0, 1],
+            physicsClientId=self.CLIENT
+        )
+
+
+
         SEG_FLAG = p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX if segmentation else p.ER_NO_SEGMENTATION_MASK
         [w, h, rgb, dep, seg] = p.getCameraImage(width=self.IMG_RES[0],
                                                  height=self.IMG_RES[1],
@@ -611,10 +626,26 @@ class BaseAviary(gym.Env):
                                                  flags=SEG_FLAG,
                                                  physicsClientId=self.CLIENT
                                                  )
+        [w, h, rgb_down, dep, seg] = p.getCameraImage(width=self.IMG_RES[0],
+                                                 height=self.IMG_RES[1],
+                                                 shadow=1,
+                                                 viewMatrix=DRONE_DOWNWARD_VIEW,
+                                                 projectionMatrix=DRONE_CAM_PRO,
+                                                 flags=SEG_FLAG,
+                                                 physicsClientId=self.CLIENT
+                                                 )
+        [w, h, rgb_fixed, dep, seg] = p.getCameraImage(width=self.IMG_RES[0],
+                                                 height=self.IMG_RES[1],
+                                                 shadow=1,
+                                                 viewMatrix=DRONE_ANGLE_VIEW,
+                                                 projectionMatrix=DRONE_CAM_PRO_FIXED,
+                                                 flags=SEG_FLAG,
+                                                 physicsClientId=self.CLIENT
+                                                 )
         rgb = np.reshape(rgb, (h, w, 4))
-        dep = np.reshape(dep, (h, w))
-        seg = np.reshape(seg, (h, w))
-        return rgb, dep, seg
+        rgb_down = np.reshape(rgb_down, (h, w, 4))
+        rgb_fixed = np.reshape(rgb_fixed, (h, w, 4))
+        return rgb, rgb_down, rgb_fixed
 
     ################################################################################
 
@@ -958,24 +989,9 @@ class BaseAviary(gym.Env):
         These obstacles are loaded from standard URDF files included in Bullet.
 
         """
-        p.loadURDF("samurai.urdf",
-                   physicsClientId=self.CLIENT
-                   )
-        p.loadURDF("duck_vhacd.urdf",
-                   [-.5, -.5, .05],
-                   p.getQuaternionFromEuler([0, 0, 0]),
-                   physicsClientId=self.CLIENT
-                   )
-        p.loadURDF("cube_no_rotation.urdf",
-                   [-.5, -2.5, .5],
-                   p.getQuaternionFromEuler([0, 0, 0]),
-                   physicsClientId=self.CLIENT
-                   )
-        p.loadURDF("sphere2.urdf",
-                   [0, 2, .5],
-                   p.getQuaternionFromEuler([0,0,0]),
-                   physicsClientId=self.CLIENT
-                   )
+
+        return
+  
     
     ################################################################################
     
