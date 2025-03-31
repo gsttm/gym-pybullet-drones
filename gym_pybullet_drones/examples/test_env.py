@@ -27,6 +27,7 @@ import pybullet as p
 import matplotlib.pyplot as plt
 import cv2
 import torch
+from mosse import *
 
 import pyvista as pv
 from torchvision.models.optical_flow import raft_small 
@@ -164,6 +165,7 @@ class OpticalFlowTracker:
 
         self.prev_rgb = frame_rgb.copy()
         return fused_vel
+    
 
 u_history = []
 plotter = None
@@ -324,6 +326,80 @@ def initializeTrajectoryTowardsObject(num_drones, control_freq_hz):
     wp_counters = np.array([0 for _ in range(num_drones)])
     
     return INIT_XYZS, INIT_RPYS, TARGET_POS, NUM_WP, wp_counters, cube_pos
+
+
+def predictRelative3DPos(drone_pos, est_frame_pos, attitude, camera_fov_deg=70, image_size=600):
+    """
+    Improved prediction of the target's relative 3D position.
+    Here we invert the vertical image offset to account for the camera coordinate system 
+    (with y downward) and thus compute more stable angles.
+    
+    Parameters:
+        drone_pos (array-like): [x, y, z] global position of the drone.
+        est_frame_pos (tuple/list): (x, y) position of the target center in the image (in pixels).
+        attitude (tuple/list): (roll, pitch, yaw) of the drone in radians.
+        camera_fov_deg (float): Camera horizontal field-of-view (default: 70).
+        image_size (int): Image size (assumed square, default: 600).
+        
+    Returns:
+        np.ndarray: Relative 3D vector from the drone to the target (in meters).
+    """
+    # Compute focal length in pixels from the nominal pinhole model.
+    f = (image_size / 2) / math.tan(math.radians(camera_fov_deg) / 2)
+    
+    # Assume that the image center is at (image_size/2, image_size/2)
+    center = image_size / 2.0
+    # Compute pixel offsets; note that we invert the y-axis.
+    dx_pixels = est_frame_pos[0] - center
+    dy_pixels = center - est_frame_pos[1]  # Invert y offset
+    
+    # Compute angle offsets in the camera frame.
+    alpha = math.atan2(dx_pixels, f)  # Horizontal angle
+    beta  = math.atan2(dy_pixels, f)   # Vertical angle
+    
+    # In the camera coordinate system, compute the unit vector pointing in the target direction.
+    # With our corrected signs, the vector is defined as:
+    cam_dir = np.array([
+        math.cos(beta) * math.cos(alpha),
+        math.cos(beta) * math.sin(alpha),
+        math.sin(beta)
+    ])
+    
+    # Convert the camera-direction vector to the global frame using the drone's attitude.
+    roll, pitch, yaw = attitude
+    Rz = np.array([
+        [ math.cos(yaw), -math.sin(yaw), 0],
+        [ math.sin(yaw),  math.cos(yaw), 0],
+        [0, 0, 1]
+    ])
+    Ry = np.array([
+        [ math.cos(pitch), 0, math.sin(pitch)],
+        [0, 1, 0],
+        [-math.sin(pitch), 0, math.cos(pitch)]
+    ])
+    Rx = np.array([
+        [1, 0, 0],
+        [0, math.cos(roll), -math.sin(roll)],
+        [0, math.sin(roll),  math.cos(roll)]
+    ])
+    # Combined rotation matrix
+    R = Rz.dot(Ry).dot(Rx)
+    global_dir = R.dot(cam_dir)
+    
+    # Assume that the target lies on the ground (global z = 0).
+    # Solve for the scale s so that the predicted ray from the drone intersects the ground.
+    if abs(global_dir[2]) < 1e-6:
+        s = 0.0
+    else:
+        s = -drone_pos[2] / global_dir[2]
+    
+    rel_pos = s * global_dir
+    rel_pos[1]=-rel_pos[1]
+    
+    # Optional: Here you could add temporal filtering of rel_pos to reduce jitter.
+    
+    return rel_pos
+
 def run(
         drone=DEFAULT_DRONES,
         num_drones=DEFAULT_NUM_DRONES,
@@ -378,6 +454,9 @@ def run(
     if drone in [DroneModel.CF2X, DroneModel.CF2P]:
         ctrl = [DSLPIDControl(drone_model=drone) for _ in range(num_drones)]
 
+    ###INITIALIZE THE MOSSE TRACKER
+    tracker = None
+
     #### Run the simulation ####################################
     action = np.zeros((num_drones, 4))
     PERIOD = 10  # seconds for a full trajectory generation
@@ -429,22 +508,40 @@ def run(
         rgb_fixed_disp = rgb_fixed[:, :, :3].astype(np.uint8)
         
         rgb_down_disp_copy = rgb_down_disp.copy()
-        
+
+        est_frame_pos = None
+        if tracker is None:
+            w,h=rgb_down_disp.shape[1], rgb_down_disp.shape[0]
+            tw,th=20,20
+            v_offset = -25
+            initBB = (int(float(w)/2.0 - tw/2.0),int(float(h)/2.0 - th/2.0 - v_offset),int(float(w)/2.0 + tw/2.0),int(float(h)/2.0 + th/2.0 - v_offset))
+            tracker = MOSSE(rgb_disp, initBB)
+            est_frame_pos = tracker.pos
+        else:
+            tracker.update(rgb_disp)
+            rgb_disp = tracker.overlay_bounding_box(rgb_disp)
+            est_frame_pos = tracker.pos
+
         est_vel = of_tracker.update(rgb_down_disp_copy, draw_on=rgb_down_disp,
                                     attitude=attitude, altitude=altitude, lin_accel=lin_accel)
 
+        drone_global_pos = obs[0][0:3]
+        est_relative_pos = predictRelative3DPos(drone_global_pos, est_frame_pos, attitude, camera_fov_deg=70, image_size=224)
+        est_global_pos = obs[0][0:3] + est_relative_pos
         actual_vel = obs[0][10:12]
         diff = (est_vel - actual_vel)**2
         
         # Use the regenerated trajectory for overlay drawing.
         rgb_disp = overlayWaypoint3DCylinder(rgb_disp,
-                                             target_pos=cube_pos,
+                                             target_pos=est_global_pos,
                                              fov_diag_deg=70,
-                                             drone_pos=obs[0][0:3],
+                                             drone_pos=drone_global_pos,
                                              attitude=attitude,
                                              traj=new_TARGET_POS)
         # Combine the images horizontally.
-        combined_img = np.hstack((rgb_disp, rgb_down_disp))
+        rgb_disp_resized = cv2.resize(rgb_disp, (600, 600))
+        rgb_down_disp_resized = cv2.resize(rgb_down_disp, (600, 600))
+        combined_img = np.hstack((rgb_disp_resized, rgb_down_disp_resized))
         cv2.imshow("Combined Drone Views", combined_img)
         cv2.waitKey(1)
 
